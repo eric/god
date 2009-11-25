@@ -6,7 +6,7 @@ module God
                   :unix_socket, :chroot, :env, :dir
     
     def initialize
-      self.log = '/dev/null'
+      self.log = nil
       
       @pid_file = nil
       @tracking_pid = true
@@ -101,19 +101,19 @@ module God
       end
       
       # log dir must exist
-      if !File.exist?(File.dirname(self.log))
+      if self.log && !File.exist?(File.dirname(self.log))
         valid = false
         applog(self, :error, "Log directory '#{File.dirname(self.log)}' does not exist")
       end
       
       # log file or dir must be writable
-      if File.exist?(self.log)
+      if self.log && File.exist?(self.log)
         unless file_writable?(self.log)
           valid = false
           applog(self, :error, "Log file '#{self.log}' exists but is not writable by #{self.uid || Etc.getlogin}")
         end
       else
-        unless file_writable?(File.dirname(self.log))
+        if self.log && !file_writable?(File.dirname(self.log))
           valid = false
           applog(self, :error, "Log directory '#{File.dirname(self.log)}' is not writable by #{self.uid || Etc.getlogin}")
         end
@@ -282,6 +282,11 @@ module God
     #
     # Returns nothing
     def spawn(command)
+      # If we aren't logging anything, let's save it to the app logger
+      if !self.log_cmd && !self.log
+        read_log_pipe, write_log_pipe = IO.pipe
+      end
+
       fork do
         uid_num = Etc.getpwnam(self.uid).uid if self.uid
         gid_num = Etc.getgrnam(self.gid).gid if self.gid
@@ -297,8 +302,11 @@ module God
         STDIN.reopen "/dev/null"
         if self.log_cmd
           STDOUT.reopen IO.popen(self.log_cmd, "a") 
-        else
+        elsif self.log
           STDOUT.reopen file_in_chroot(self.log), "a"        
+        else
+          read_log_pipe.close
+          STDOUT.reopen write_log_pipe
         end
         if err_log_cmd
           STDERR.reopen IO.popen(err_log_cmd, "a") 
@@ -318,6 +326,18 @@ module God
         end
 
         exec command unless command.empty?
+      end
+
+      # If we aren't doing anything with logging, send the log data to the
+      # app logger
+      if !self.log_cmd && !self.log
+        write_log_pipe.close
+
+        Thread.new(read_log_pipe) do |io|
+          io.each_line do |line|
+            applog(self, :info, "#{self.name}: #{line}")
+          end
+        end
       end
     end
     
