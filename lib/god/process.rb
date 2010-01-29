@@ -41,7 +41,7 @@ module God
         File.writable?(file_in_chroot(file)) ? exit(0) : exit(1)
       end
       
-      wpid, status = ::Process.waitpid2(pid)
+      _, status = ::Process.waitpid2(pid)
       status.exitstatus == 0 ? true : false
     end
     
@@ -228,34 +228,15 @@ module God
         pid = nil
         
         if @tracking_pid
-          # double fork god-daemonized processes
-          # we don't want to wait for them to finish
-          r, w = IO.pipe
-          begin
-            opid = fork do
-              STDOUT.reopen(w)
-              r.close
-              pid = self.spawn(command)
-              puts pid.to_s # send pid back to forker
-            end
-            
-            ::Process.waitpid(opid, 0)
-            w.close
-            pid = r.gets.chomp
-          ensure
-            # make sure the file descriptors get closed no matter what
-            r.close rescue nil
-            w.close rescue nil
-          end
+          pid = self.spawn(command, true)
         else
           # single fork self-daemonizing processes
           # we want to wait for them to finish
           pid = self.spawn(command)
-          status = ::Process.waitpid2(pid, 0)
-          exit_code = status[1] >> 8
+          _, status = ::Process.waitpid2(pid, 0)
           
-          if exit_code != 0
-            applog(self, :warn, "#{self.name} #{action} command exited with non-zero code = #{exit_code}")
+          if status.exitstatus
+            applog(self, :warn, "#{self.name} #{action} command exited with non-zero code = #{status.exitstatus}")
           end
           
           ensure_stop if action == :stop
@@ -279,15 +260,19 @@ module God
     
     # Fork/exec the given command, returns immediately
     #   +command+ is the String containing the shell command
+    #   +detach_child+ is a Boolean that specifies if the child should 
+    #                  be detached
     #
-    # Returns nothing
-    def spawn(command)
+    # Returns Integer(pid)
+    def spawn(command, detach_child = false)
       # If we aren't logging anything, let's save it to the app logger
       if !self.log_cmd && !self.log
-        read_log_pipe, write_log_pipe = IO.pipe
+        logr, logw = IO.pipe
       end
 
-      fork do
+      pid = process_fork(detach_child) do
+        logr.close if logr
+
         uid_num = Etc.getpwnam(self.uid).uid if self.uid
         gid_num = Etc.getgrnam(self.gid).gid if self.gid
 
@@ -297,25 +282,30 @@ module God
         ::Process::Sys.setgid(gid_num) if self.gid
         ::Process::Sys.setuid(uid_num) if self.uid
         self.dir ||= '/'
-        Dir.chdir self.dir
+        Dir.chdir(self.dir)
         $0 = command
-        STDIN.reopen "/dev/null"
+
+        STDIN.reopen("/dev/null")
         if self.log_cmd
-          STDOUT.reopen IO.popen(self.log_cmd, "a") 
+          STDOUT.reopen(IO.popen(self.log_cmd, "a"))
         elsif self.log
-          STDOUT.reopen file_in_chroot(self.log), "a"        
+          STDOUT.reopen(file_in_chroot(self.log), "a")
+        elsif logw
+          STDOUT.reopen(logw)
         else
-          read_log_pipe.close
-          STDOUT.reopen write_log_pipe
+          STDOUT.reopen("/dev/null", 'a')
         end
-        if err_log_cmd
-          STDERR.reopen IO.popen(err_log_cmd, "a") 
-        elsif err_log && (log_cmd || err_log != log)
-          STDERR.reopen file_in_chroot(err_log), "a"        
+
+        if self.err_log_cmd
+          STDERR.reopen(IO.popen(self.err_log_cmd, "a"))
+        elsif self.err_log && (self.log_cmd || self.err_log != self.log)
+          STDERR.reopen(file_in_chroot(self.err_log), "a")
+        elsif logw
+          STDOUT.reopen(logw)
         else
-          STDERR.reopen STDOUT
+          STDERR.reopen("/dev/null", 'a')
         end
-        
+
         # close any other file descriptors
         3.upto(256){|fd| IO::new(fd).close rescue nil}
 
@@ -330,17 +320,80 @@ module God
 
       # If we aren't doing anything with logging, send the log data to the
       # app logger
-      if !self.log_cmd && !self.log
-        write_log_pipe.close
+      if logr
+        logw.close
 
-        Thread.new(read_log_pipe) do |io|
-          io.each_line do |line|
-            applog(self, :info, "#{self.name}: #{line}")
+        Thread.new(logr) do |io|
+          begin
+            io.each_line do |line|
+              applog(self, :info, "#{self.name}: -> #{line.chomp}")
+            end
+          rescue Exception => e
+            applog(self, :info, "#{self.name}: exception => #{e.class}: #{e.message}")
+          ensure
+            logr.close rescue nil
           end
         end
+
+      end
+
+      return pid
+    rescue Object
+      # We aren't able to use an ensure block here because it gets called for
+      # the child process as well
+      if logr
+        logr.close rescue nil
+        logw.close rescue nil
+      end
+
+      raise
+    end
+
+    def process_fork(double_fork = false, &block)
+      if double_fork
+        detached_fork(&block)
+      else
+        fork(&block)
       end
     end
-    
+
+    # Perform a fork that detaches the child from the parent process. This
+    # is done by forking twice and passing the grand-child pid back to
+    # the parent. This removes the need to use Process.detach()
+    #
+    # Returns Integer(pid)
+    def detached_fork(&block)
+      r, w = IO.pipe
+      opid = fork do
+        r.close
+        pid = fork(&block)
+        w.puts(pid.to_s) # send pid back to forker
+        w.flush
+      end
+
+      w.close
+
+      _, status = ::Process.waitpid2(opid, 0)
+
+      if status.exitstatus != 0
+        applog(self, :warn, "#{self.name} command exited with non-zero code = #{status.exitstatus}")
+      end
+
+      output = r.read
+
+      unless output.match(/^\d+$/)
+        applog(self, :warn, "#{self.name} command returned an invalid response:\n#{output}")
+
+        raise "Malformed response from child:\n#{output}"
+      end
+
+      return output.chomp.to_i
+    ensure
+      # make sure the file descriptors get closed no matter what
+      r.close rescue nil
+      w.close rescue nil
+    end
+
     # Ensure that a stop command actually stops the process. Force kill
     # if necessary.
     #

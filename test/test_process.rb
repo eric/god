@@ -120,9 +120,9 @@ class TestProcessChild < Test::Unit::TestCase
     # Only for start, restart
     [:start, :restart].each do |action|
       @p.stubs(:test).returns true
-      IO.expects(:pipe).returns([StringIO.new('1234'), StringIO.new])
+      IO.expects(:pipe).twice.returns([StringIO.new, StringIO.new]).then.returns([StringIO.new('1234'), StringIO.new])
       @p.expects(:fork)
-      Process.expects(:waitpid)
+      Process.expects(:waitpid2).returns([1234, stub(:exitstatus => 0)])
       File.expects(:open).with(@p.default_pid_file, 'w')
       @p.send("#{action}=", "run")
       @p.call_action(action)
@@ -214,7 +214,7 @@ class TestProcessDaemon < Test::Unit::TestCase
   def test_call_action_with_string_should_call_system
     @p.start = "do something"
     @p.expects(:fork)
-    Process.expects(:waitpid2).returns([123, 0])
+    Process.expects(:waitpid2).returns([123, stub(:exitstatus => 0)])
     @p.call_action(:start)
   end
   
